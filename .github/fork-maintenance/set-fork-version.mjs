@@ -25,7 +25,7 @@ function deriveForkVersion(upstreamVersion) {
   }
 
   const [, major, minor, patch] = match;
-  return `${major}.${minor}.${Number(patch) + 1}-fred.1`;
+  return `${major}.${minor}.${Number(patch) + 1}`;
 }
 
 const expectedVersion = verifyOnly ? inputVersion : deriveForkVersion(inputVersion);

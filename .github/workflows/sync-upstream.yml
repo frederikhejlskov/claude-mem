@@ -269,10 +269,7 @@ jobs:
           actual_version=$(git show "$candidate_sha:package.json" | node -e \
             "let s=''; process.stdin.on('data', d => s += d); process.stdin.on('end', () => process.stdout.write(JSON.parse(s).version));")
           test "$actual_version" = "$FORK_VERSION"
-          case "$actual_version" in
-            *-fred.1) ;;
-            *) echo "Candidate is not a controlled fork version: $actual_version" >&2; exit 1 ;;
-          esac
+          printf '%s\n' "$actual_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
 
           git push origin "$candidate_sha:refs/heads/main"
 
