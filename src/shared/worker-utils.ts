@@ -384,14 +384,22 @@ async function waitForWorkerReadiness(timeoutMs: number = HOOK_READINESS_TIMEOUT
  * parsed regardless of status — same contract as restart-verify.ts. Returns
  * null when the worker is unreachable or the payload is malformed.
  */
-async function fetchWorkerHealthVersion(): Promise<string | null> {
+interface WorkerHealthIdentity {
+  pid: number | null;
+  version: string | null;
+}
+
+async function fetchWorkerHealthIdentity(): Promise<WorkerHealthIdentity | null> {
   try {
     const response = await workerHttpRequest('/api/health', { timeoutMs: HEALTH_CHECK_TIMEOUT_MS });
-    const body = await response.json() as { version?: unknown };
-    return typeof body.version === 'string' ? body.version : null;
+    const body = await response.json() as { pid?: unknown; version?: unknown };
+    return {
+      pid: typeof body.pid === 'number' && Number.isInteger(body.pid) && body.pid > 0 ? body.pid : null,
+      version: typeof body.version === 'string' ? body.version : null,
+    };
   } catch (error: unknown) {
     const err = error instanceof Error ? error : new Error(String(error));
-    logger.debug('SYSTEM', 'Worker health-version fetch failed', {}, err);
+    logger.debug('SYSTEM', 'Worker health-identity fetch failed', {}, err);
     return null;
   }
 }
@@ -423,7 +431,7 @@ async function waitForWorkerPortClosed(timeoutMs = 5000): Promise<boolean> {
  * the same invocation re-creates the restart storm.
  */
 async function warnIfVersionStillMismatched(expectedPluginVersion: string): Promise<void> {
-  const observedVersion = await fetchWorkerHealthVersion();
+  const observedVersion = (await fetchWorkerHealthIdentity())?.version ?? null;
   if (observedVersion !== null && observedVersion !== expectedPluginVersion) {
     logger.warn('SYSTEM', 'Worker is ready but still reports a stale version; not recycling again in this hook invocation (one recycle per hook event)', {
       pluginVersion: expectedPluginVersion,
@@ -447,6 +455,7 @@ async function isWorkerPortAlive(): Promise<boolean> {
   const pidStatus = validateWorkerPidFile({ logAlive: false });
   if (pidStatus === 'missing') return true;
   if (pidStatus === 'alive') return true;
+  if (pidStatus === 'unverified') return true;
   return false;
 }
 
@@ -502,7 +511,24 @@ export async function ensureWorkerRunning(): Promise<boolean> {
     // stale-version code; the lazy-spawn below, using this install's
     // resolver, is then the only spawner.
     const stalePidInfo = readOwnedWorkerPidInfo();
-    if (stalePidInfo === null || stalePidInfo.port !== getWorkerPort()) {
+    let stalePid = stalePidInfo?.port === getWorkerPort() ? stalePidInfo.pid : null;
+    if (stalePid === null) {
+      // The worker health response is self-reported by the process currently
+      // serving the configured claude-mem port. It is the recovery identity
+      // when the shared PID file was deleted or rejected. Re-fetch and require
+      // the same version observed by checkVersionMatch so a worker replacement
+      // racing this hook is never killed from a stale response.
+      const healthIdentity = await fetchWorkerHealthIdentity();
+      if (healthIdentity?.pid !== null && healthIdentity?.version === workerVersion) {
+        stalePid = healthIdentity.pid;
+        logger.warn('SYSTEM', 'PID file does not identify the stale worker; using /api/health pid for version recycle', {
+          port: getWorkerPort(),
+          pid: stalePid,
+          workerVersion,
+        });
+      }
+    }
+    if (stalePid === null) {
       logger.error('SYSTEM', 'Stale worker is serving the port but the PID file does not identify it; kill the claude-mem worker process manually', {
         port: getWorkerPort(),
         pidFilePid: stalePidInfo?.pid ?? null,
@@ -511,21 +537,21 @@ export async function ensureWorkerRunning(): Promise<boolean> {
       return false;
     }
     try {
-      process.kill(stalePidInfo.pid, 'SIGKILL');
+      process.kill(stalePid, 'SIGKILL');
     } catch (error: unknown) {
       // ESRCH: it exited between the health probe and the kill — the port is
       // free (or about to be) either way.
       if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
         logger.error('SYSTEM', 'Could not kill stale worker', {
-          pid: stalePidInfo.pid,
-          port: stalePidInfo.port,
+          pid: stalePid,
+          port: getWorkerPort(),
         }, error instanceof Error ? error : new Error(String(error)));
         return false;
       }
     }
     if (!(await waitForWorkerPortClosed())) {
       logger.error('SYSTEM', 'Stale worker port still open after SIGKILL; skipping spawn this hook event', {
-        pid: stalePidInfo.pid,
+        pid: stalePid,
         port: getWorkerPort(),
       });
       return false;

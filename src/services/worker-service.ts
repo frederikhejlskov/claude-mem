@@ -43,9 +43,9 @@ import {
   getPlatformTimeout,
   runOneTimeCwdRemap,
   cleanStalePidFile,
+  maintainPidFile,
   verifyPidFileOwnership,
-  spawnDaemon,
-  touchPidFile
+  spawnDaemon
 } from './infrastructure/ProcessManager.js';
 import { runOneTimeV12_4_3Cleanup } from './infrastructure/CleanupV12_4_3.js';
 import {
@@ -197,6 +197,7 @@ function readAndClearCleanShutdownSentinel(): string | null {
 export class WorkerService implements WorkerRef {
   private server: Server;
   private startTime: number = Date.now();
+  private pidFileHeartbeat: ReturnType<typeof setInterval> | null = null;
   // Crash detection (worker_started telemetry): derived once at startup from
   // the previous run's stale PID file + the clean-shutdown sentinel.
   private previousShutdown: 'clean' | 'crash' | 'unknown' = 'unknown';
@@ -420,11 +421,16 @@ export class WorkerService implements WorkerRef {
 
     await this.server.listen(port, host);
 
-    writePidFile({
+    const pidInfo = {
       pid: process.pid,
       port,
       startedAt: new Date().toISOString()
-    });
+    };
+    writePidFile(pidInfo);
+    this.pidFileHeartbeat = setInterval(() => {
+      maintainPidFile(pidInfo);
+    }, 30_000);
+    this.pidFileHeartbeat.unref();
 
     getSupervisor().registerProcess('worker', {
       pid: process.pid,
@@ -791,6 +797,13 @@ export class WorkerService implements WorkerRef {
       isShuttingDown: () => this.isShuttingDown,
       markShuttingDown: () => { this.isShuttingDown = true; },
       beforeGracefulShutdown: async () => {
+        // Stop before restart handoff. The predecessor must never re-assert
+        // its PID file after a successor has started.
+        if (this.pidFileHeartbeat) {
+          clearInterval(this.pidFileHeartbeat);
+          this.pidFileHeartbeat = null;
+        }
+
         if (this.transcriptWatcher) {
           this.transcriptWatcher.stop();
           this.transcriptWatcher = null;

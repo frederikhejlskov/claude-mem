@@ -2,6 +2,7 @@ import { existsSync, readFileSync, rmSync } from 'fs';
 import { logger } from '../utils/logger.js';
 import {
   getProcessRegistry,
+  isPidAlive,
   verifyPidFileOwnership,
   type ManagedProcessInfo,
   type PidInfo,
@@ -18,7 +19,7 @@ interface ValidateWorkerPidOptions {
   pidFilePath?: string;
 }
 
-export type ValidateWorkerPidStatus = 'missing' | 'alive' | 'stale' | 'invalid';
+export type ValidateWorkerPidStatus = 'missing' | 'alive' | 'stale' | 'invalid' | 'unverified';
 
 class Supervisor {
   private readonly registry: ProcessRegistry;
@@ -193,8 +194,9 @@ export function validateWorkerPidFile(options: ValidateWorkerPidOptions = {}): V
     return 'invalid';
   }
 
-  const isAlive = verifyPidFileOwnership(pidInfo);
-  if (isAlive && pidInfo) {
+  const pidIsAlive = pidInfo !== null && isPidAlive(pidInfo.pid);
+  const ownershipVerified = pidIsAlive && verifyPidFileOwnership(pidInfo);
+  if (ownershipVerified && pidInfo) {
     if (options.logAlive ?? true) {
       logger.info('SYSTEM', 'Worker already running (PID alive)', {
         existingPid: pidInfo.pid,
@@ -205,7 +207,20 @@ export function validateWorkerPidFile(options: ValidateWorkerPidOptions = {}): V
     return 'alive';
   }
 
-  logger.info('SYSTEM', 'Removing stale PID file (worker process is dead or PID has been reused)', {
+  if (pidIsAlive && pidInfo) {
+    // A token mismatch proves only that this file does not verify ownership.
+    // It does not prove the live process is stale, and the recorded port may
+    // still be serving /api/health. Leave the shared file intact so async
+    // callers can use health as the second authority.
+    logger.warn('SYSTEM', 'Worker PID file names a live process but its identity token could not be verified; leaving it intact', {
+      pid: pidInfo.pid,
+      port: pidInfo.port,
+      startedAt: pidInfo.startedAt
+    });
+    return 'unverified';
+  }
+
+  logger.info('SYSTEM', 'Removing stale PID file (worker process is dead)', {
     pid: pidInfo?.pid,
     port: pidInfo?.port,
     startedAt: pidInfo?.startedAt

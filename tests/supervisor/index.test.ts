@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { validateWorkerPidFile, type ValidateWorkerPidStatus } from '../../src/supervisor/index.js';
@@ -70,7 +70,7 @@ describe('validateWorkerPidFile', () => {
   });
 
   const tokenSupported = process.platform === 'linux' || process.platform === 'darwin';
-  it.if(tokenSupported)('returns "stale" when startToken does not match the live PID (PID reused)', () => {
+  it.if(tokenSupported)('returns "unverified" without deleting when startTokenV2 does not match a live PID', () => {
     const tempDir = makeTempDir();
     tempDirs.push(tempDir);
     const pidFilePath = path.join(tempDir, 'worker.pid');
@@ -78,11 +78,12 @@ describe('validateWorkerPidFile', () => {
       pid: process.pid,
       port: 37777,
       startedAt: new Date().toISOString(),
-      startToken: 'token-from-a-different-incarnation'
+      startTokenV2: 'token-from-a-different-incarnation'
     }));
 
     const status = validateWorkerPidFile({ logAlive: false, pidFilePath });
-    expect(status).toBe('stale');
+    expect(status).toBe('unverified');
+    expect(existsSync(pidFilePath)).toBe(true);
   });
 });
 

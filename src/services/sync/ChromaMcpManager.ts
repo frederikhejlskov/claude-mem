@@ -12,7 +12,7 @@ import { USER_SETTINGS_PATH, paths } from '../../shared/paths.js';
 import { getUvxBinDirs } from '../../shared/uvx-bin-dirs.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { getSupervisor } from '../../supervisor/index.js';
-import { captureProcessStartToken, isPidAlive } from '../../supervisor/process-registry.js';
+import { captureProcessStartToken, isPidAlive, usesPsStartToken } from '../../supervisor/process-registry.js';
 import { clearDependencyStatus, recordChromaVectorSearchUnavailable, recordUvxVectorSearchUnavailable } from '../../shared/dependency-health.js';
 import { ChromaUnavailableError } from '../worker/search/errors.js';
 
@@ -74,7 +74,10 @@ interface ChromaWriterLockPayload {
   ownerId: string;
   dataDir: string;
   acquiredAt: string;
+  /** Legacy timezone-dependent token on ps-based platforms. */
   startToken?: string | null;
+  /** Timezone-stable token; older installs ignore this field safely. */
+  startTokenV2?: string | null;
 }
 
 export class ChromaMcpManager {
@@ -393,12 +396,14 @@ export class ChromaMcpManager {
 
     fs.mkdirSync(normalizedDataDir, { recursive: true });
     const lockPath = path.join(normalizedDataDir, CHROMA_WRITER_LOCK_FILENAME);
+    const startToken = captureProcessStartToken(process.pid);
     const payload: ChromaWriterLockPayload = {
       pid: process.pid,
       ownerId: this.chromaWriterOwnerId,
       dataDir: normalizedDataDir,
       acquiredAt: new Date().toISOString(),
-      startToken: captureProcessStartToken(process.pid),
+      ...(!usesPsStartToken() && startToken ? { startToken } : {}),
+      startTokenV2: startToken,
     };
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -509,6 +514,7 @@ export class ChromaMcpManager {
         dataDir: raw.dataDir,
         acquiredAt: raw.acquiredAt,
         startToken: typeof raw.startToken === 'string' || raw.startToken === null ? raw.startToken : undefined,
+        startTokenV2: typeof raw.startTokenV2 === 'string' || raw.startTokenV2 === null ? raw.startTokenV2 : undefined,
       };
     } catch {
       return null;
@@ -519,11 +525,15 @@ export class ChromaMcpManager {
     if (!isPidAlive(lock.pid)) {
       return false;
     }
-    if (!lock.startToken) {
+    const isLegacyPsToken = lock.startTokenV2 === undefined
+      && typeof lock.startToken === 'string'
+      && usesPsStartToken();
+    if (isLegacyPsToken || (!lock.startTokenV2 && !lock.startToken)) {
       return true;
     }
+    const storedStartToken = lock.startTokenV2 ?? lock.startToken;
     const currentStartToken = captureProcessStartToken(lock.pid);
-    return currentStartToken === null || currentStartToken === lock.startToken;
+    return currentStartToken === null || currentStartToken === storedStartToken;
   }
 
   private static buildLauncherPrefix(pythonVersion: string): string[] {

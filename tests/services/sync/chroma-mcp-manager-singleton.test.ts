@@ -727,6 +727,12 @@ describe('ChromaMcpManager singleton enforcement (#2313)', () => {
       dataDir: path.resolve(mockedChromaDir),
     });
     expect(typeof lock.ownerId).toBe('string');
+    expect(typeof lock.startTokenV2).toBe('string');
+    if (process.platform === 'linux' || process.platform === 'win32') {
+      expect(lock.startToken).toBe(lock.startTokenV2);
+    } else {
+      expect(lock.startToken).toBeUndefined();
+    }
     expect(getDependencyStatus('chroma')).toBeNull();
 
     await mgr.stop();

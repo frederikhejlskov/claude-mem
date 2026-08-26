@@ -38,6 +38,7 @@ let ownedPidInfo: { pid: number; port: number; startedAt: string } | null = null
 // the port until it is killed; the successor serves it after spawnHidden.
 let staleWorkerAlive = true;
 let successorUp = false;
+let healthPid: unknown = STALE_PID;
 
 // Records every spawn attempt (the lazy-spawn seam, spawnHidden in spawn.ts).
 const spawnCalls: Array<{ command: string; args: string[] }> = [];
@@ -85,6 +86,7 @@ function installFetchMock(): void {
     }
     if (u.includes('/api/health')) {
       return okResponse({
+        pid: staleWorkerAlive ? healthPid : 5151,
         version: staleWorkerAlive ? versionMatchResult.workerVersion : versionMatchResult.pluginVersion,
       });
     }
@@ -110,6 +112,7 @@ describe('ensureWorkerRunning — stale-worker recycle on version mismatch', () 
     spawnCalls.length = 0;
     staleWorkerAlive = true;
     successorUp = false;
+    healthPid = STALE_PID;
     ownedPidInfo = null;
     killCalls = [];
     killError = null;
@@ -168,9 +171,22 @@ describe('ensureWorkerRunning — stale-worker recycle on version mismatch', () 
     expect(restartCalls.length).toBe(0);
   });
 
-  it('returns false without killing anything when the PID file does not identify the stale worker', async () => {
+  it('falls back to the health-response PID when the shared PID file is missing', async () => {
     versionMatchResult = { matches: false, pluginVersion: PLUGIN_VERSION, workerVersion: STALE_VERSION };
     ownedPidInfo = null;
+
+    const workerUtils = await importWorkerUtilsFresh();
+    const result = await workerUtils.ensureWorkerRunning();
+
+    expect(result).toBe(true);
+    expect(killCalls).toEqual([{ pid: STALE_PID, signal: 'SIGKILL' }]);
+    expect(spawnCalls.length).toBe(1);
+  });
+
+  it('does not kill when neither the PID file nor health response provides a valid PID', async () => {
+    versionMatchResult = { matches: false, pluginVersion: PLUGIN_VERSION, workerVersion: STALE_VERSION };
+    ownedPidInfo = null;
+    healthPid = 'not-a-pid';
 
     const workerUtils = await importWorkerUtilsFresh();
     const result = await workerUtils.ensureWorkerRunning();

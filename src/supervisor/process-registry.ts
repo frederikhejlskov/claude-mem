@@ -11,6 +11,11 @@ const REAP_SESSION_SIGKILL_TIMEOUT_MS = 1_000;
 
 const DEFAULT_REGISTRY_PATH = paths.supervisorRegistry();
 
+/** Platforms whose process start token is captured through `ps lstart`. */
+export function usesPsStartToken(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== 'linux' && platform !== 'win32';
+}
+
 export interface ManagedProcessInfo {
   pid: number;
   type: string;
@@ -62,7 +67,10 @@ export interface PidInfo {
   pid: number;
   port: number;
   startedAt: string;
+  /** Legacy token. On ps-based platforms this inherited the local timezone. */
   startToken?: string;
+  /** Timezone-stable token. Kept separate so older installs ignore it safely. */
+  startTokenV2?: string;
 }
 
 // Windows lacks a cheap /proc-style start-time read and `ps lstart`, so we
@@ -149,7 +157,10 @@ export function captureProcessStartToken(pid: number): string | null {
       timeout: 2000,
       // Uniform spawn-env discipline: sanitize even for read-only system
       // binaries so the spawn-env CI check stays a single rule (#2357/#2375).
-      env: { ...sanitizeEnv(process.env), LC_ALL: 'C', LANG: 'C' }
+      // BSD ps formats lstart through localtime(), so locale alone is not
+      // enough: pin UTC to keep a live process's identity stable across
+      // travel, automatic timezone changes, and DST transitions.
+      env: { ...sanitizeEnv(process.env), LC_ALL: 'C', LANG: 'C', TZ: 'UTC' }
     });
     if (result.status !== 0) return null;
     const token = result.stdout.trim();
@@ -167,16 +178,32 @@ export function verifyPidFileOwnership(info: PidInfo | null): info is PidInfo {
   if (!info) return false;
   if (!isPidAlive(info.pid)) return false;
 
-  if (!info.startToken) return true;
+  // V1 ps tokens were written in the machine's local timezone. Comparing one
+  // after a timezone or DST change produces a false PID-reuse verdict. Treat
+  // those existing files like pre-token PID files for one worker lifetime.
+  // Linux /proc and Windows CIM tokens were already timezone-independent, so
+  // their V1 identity checks remain valid.
+  const isLegacyPsToken = info.startTokenV2 === undefined
+    && info.startToken !== undefined
+    && usesPsStartToken();
+  if (isLegacyPsToken) {
+    logger.debug('SYSTEM', 'verifyPidFileOwnership: legacy ps start-token is timezone-dependent; using liveness fallback', {
+      pid: info.pid
+    });
+    return true;
+  }
+
+  const storedToken = info.startTokenV2 ?? info.startToken;
+  if (!storedToken) return true;
 
   const currentToken = captureProcessStartToken(info.pid);
   if (currentToken === null) return true;
 
-  const match = currentToken === info.startToken;
+  const match = currentToken === storedToken;
   if (!match) {
     logger.debug('SYSTEM', 'verifyPidFileOwnership: start-token mismatch (PID reused)', {
       pid: info.pid,
-      stored: info.startToken,
+      stored: storedToken,
       current: currentToken
     });
   }

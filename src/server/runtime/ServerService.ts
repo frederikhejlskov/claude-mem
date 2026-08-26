@@ -12,6 +12,7 @@ import { paths } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import {
   captureProcessStartToken,
+  usesPsStartToken,
   verifyPidFileOwnership,
   type PidInfo,
 } from '../../supervisor/process-registry.js';
@@ -837,11 +838,13 @@ function spawnServerDaemon(port: number): number | undefined {
 
 function writeServerState(state: ServerRuntimeState): void {
   mkdirSync(dirname(paths.serverRuntime()), { recursive: true });
+  const startToken = captureProcessStartToken(state.pid) ?? undefined;
   const pidInfo: PidInfo = {
     pid: state.pid,
     port: state.port,
     startedAt: state.startedAt,
-    startToken: captureProcessStartToken(state.pid) ?? undefined,
+    ...(!usesPsStartToken() && startToken ? { startToken } : {}),
+    startTokenV2: startToken,
   };
   writeFileSync(paths.serverPid(), JSON.stringify(pidInfo, null, 2));
   writeFileSync(paths.serverPort(), `${state.port}\n`);

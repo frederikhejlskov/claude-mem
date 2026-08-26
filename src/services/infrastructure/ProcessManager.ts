@@ -124,15 +124,29 @@ function resolveWorkerRuntimePathUncached(options: RuntimeResolverOptions): stri
 
 import {
   captureProcessStartToken,
+  usesPsStartToken,
   verifyPidFileOwnership,
   type PidInfo
 } from '../../supervisor/process-registry.js';
-export { captureProcessStartToken, verifyPidFileOwnership, type PidInfo };
+export { captureProcessStartToken, usesPsStartToken, verifyPidFileOwnership, type PidInfo };
 
 export function writePidFile(info: PidInfo): void {
   mkdirSync(DATA_DIR, { recursive: true });
-  const resolvedToken = info.startToken ?? captureProcessStartToken(info.pid);
-  const payload: PidInfo = resolvedToken ? { ...info, startToken: resolvedToken } : info;
+  // Never emit the legacy startToken field on ps-based platforms. Older
+  // claude-mem installations ignore unknown fields and therefore fall back to
+  // PID liveness instead of comparing their timezone-sensitive ps output
+  // against a UTC token. This is required because Claude Code and Codex
+  // installs share this PID file. Keep V1 on Linux/Windows, where it is stable,
+  // so older readers retain PID-reuse protection during a rolling upgrade.
+  const { startToken: _legacyStartToken, startTokenV2, ...baseInfo } = info;
+  const resolvedToken = startTokenV2 ?? captureProcessStartToken(info.pid);
+  const payload: PidInfo = resolvedToken
+    ? {
+        ...baseInfo,
+        ...(!usesPsStartToken() ? { startToken: resolvedToken } : {}),
+        startTokenV2: resolvedToken
+      }
+    : baseInfo;
   writeFileSync(PID_FILE, JSON.stringify(payload, null, 2));
 }
 
@@ -458,6 +472,41 @@ export function touchPidFile(): void {
   } catch {
     // Best-effort — failure to touch doesn't affect correctness
   }
+}
+
+export type MaintainPidFileStatus = 'current' | 'repaired' | 'foreign-owner';
+
+/**
+ * Re-assert the running worker's PID file without clobbering another live
+ * owner. This closes the permanent-missing-file wedge: the worker calls it on
+ * a 30-second heartbeat, so deletion or corruption self-repairs in-process.
+ */
+export function maintainPidFile(info: PidInfo): MaintainPidFileStatus {
+  const current = readPidFile();
+
+  if (current?.pid === info.pid && verifyPidFileOwnership(current)) {
+    // Upgrade a live V1 file when capture is supported. If capture is not
+    // available on this platform, touching remains the best-effort heartbeat.
+    if (current.startTokenV2 || captureProcessStartToken(info.pid) === null) {
+      touchPidFile();
+      return 'current';
+    }
+  } else if (current && current.pid !== info.pid && verifyPidFileOwnership(current)) {
+    logger.warn('SYSTEM', 'PID-file heartbeat found a different live owner; leaving it untouched', {
+      expectedPid: info.pid,
+      recordedPid: current.pid,
+      path: PID_FILE
+    });
+    return 'foreign-owner';
+  }
+
+  writePidFile(info);
+  logger.warn('SYSTEM', 'PID-file heartbeat repaired missing, stale, or legacy worker identity', {
+    pid: info.pid,
+    port: info.port,
+    path: PID_FILE
+  });
+  return 'repaired';
 }
 
 export function cleanStalePidFile(): ValidateWorkerPidStatus {

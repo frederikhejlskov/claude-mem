@@ -25,6 +25,7 @@ const {
   cleanStalePidFile,
   isPidFileRecent,
   touchPidFile,
+  maintainPidFile,
   spawnDaemon,
   buildWindowsDaemonStartCommand,
   resolveWorkerRuntimePath,
@@ -424,6 +425,25 @@ describe('ProcessManager', () => {
       expect(first).toBe(second);
     });
 
+    it.if(process.platform === 'darwin')('returns the same token after the caller timezone changes', () => {
+      const previousTz = process.env.TZ;
+      try {
+        process.env.TZ = 'Pacific/Honolulu';
+        const honolulu = captureProcessStartToken(process.pid);
+        process.env.TZ = 'Asia/Tokyo';
+        const tokyo = captureProcessStartToken(process.pid);
+
+        expect(honolulu).not.toBeNull();
+        expect(tokyo).toBe(honolulu);
+      } finally {
+        if (previousTz === undefined) {
+          delete process.env.TZ;
+        } else {
+          process.env.TZ = previousTz;
+        }
+      }
+    });
+
     it('returns null for a non-existent PID', () => {
       expect(captureProcessStartToken(2147483647)).toBeNull();
     });
@@ -479,26 +499,53 @@ describe('ProcessManager', () => {
   describe('writePidFile (start-token capture)', () => {
     const supported = process.platform === 'linux' || process.platform === 'darwin';
 
-    it.if(supported)('auto-captures a startToken when writing for the current process', () => {
+    it.if(supported)('writes V2 and only publishes V1 where legacy readers are timezone-safe', () => {
       writePidFile({ pid: process.pid, port: 37777, startedAt: new Date().toISOString() });
       const persisted = readPidFile();
       expect(persisted).not.toBeNull();
-      expect(typeof persisted!.startToken).toBe('string');
-      expect((persisted!.startToken ?? '').length).toBeGreaterThan(0);
+      expect(typeof persisted!.startTokenV2).toBe('string');
+      expect((persisted!.startTokenV2 ?? '').length).toBeGreaterThan(0);
+      if (process.platform === 'linux' || process.platform === 'win32') {
+        expect(persisted!.startToken).toBe(persisted!.startTokenV2);
+      } else {
+        expect(persisted!.startToken).toBeUndefined();
+      }
     });
 
-    it('preserves a caller-supplied startToken verbatim', () => {
+    it('preserves a caller-supplied startTokenV2 verbatim', () => {
       const provided = 'caller-supplied-token-xyz';
-      writePidFile({ pid: process.pid, port: 37777, startedAt: new Date().toISOString(), startToken: provided });
+      writePidFile({ pid: process.pid, port: 37777, startedAt: new Date().toISOString(), startTokenV2: provided });
       const persisted = readPidFile();
-      expect(persisted!.startToken).toBe(provided);
+      expect(persisted!.startTokenV2).toBe(provided);
+      if (process.platform === 'linux' || process.platform === 'win32') {
+        expect(persisted!.startToken).toBe(provided);
+      } else {
+        expect(persisted!.startToken).toBeUndefined();
+      }
+    });
+
+    it.if(supported)('replaces a caller-supplied legacy token instead of exposing it to older installs', () => {
+      writePidFile({
+        pid: process.pid,
+        port: 37777,
+        startedAt: new Date().toISOString(),
+        startToken: 'legacy-local-time-token'
+      });
+      const persisted = readPidFile();
+      const currentToken = captureProcessStartToken(process.pid);
+      expect(persisted!.startTokenV2).toBe(currentToken);
+      if (process.platform === 'linux' || process.platform === 'win32') {
+        expect(persisted!.startToken).toBe(currentToken);
+      } else {
+        expect(persisted!.startToken).toBeUndefined();
+      }
     });
 
     it('omits startToken when the target PID has no readable token (dead PID)', () => {
       writePidFile({ pid: 2147483647, port: 37777, startedAt: new Date().toISOString() });
       const persisted = readPidFile();
       expect(persisted).not.toBeNull();
-      expect(persisted!.startToken).toBeUndefined();
+      expect(persisted!.startTokenV2).toBeUndefined();
     });
   });
 
@@ -527,24 +574,39 @@ describe('ProcessManager', () => {
       })).toBe(true);
     });
 
-    it.if(supported)('returns true when the stored token matches the current PID', () => {
+    it.if(supported)('returns true when the stored V2 token matches the current PID', () => {
       const token = captureProcessStartToken(process.pid);
       expect(token).not.toBeNull();
       expect(verifyPidFileOwnership({
         pid: process.pid,
         port: 37777,
         startedAt: new Date().toISOString(),
-        startToken: token!
+        startTokenV2: token!
       })).toBe(true);
     });
 
-    it.if(supported)('returns false when the stored token does not match (PID reused)', () => {
+    it.if(supported)('returns false when the stored V2 token does not match (PID reused)', () => {
       expect(verifyPidFileOwnership({
         pid: process.pid,
         port: 37777,
         startedAt: new Date().toISOString(),
-        startToken: 'token-from-a-different-incarnation'
+        startTokenV2: 'token-from-a-different-incarnation'
       })).toBe(false);
+    });
+
+    it('treats a legacy ps token as unverifiable instead of stale', () => {
+      const originalPlatform = process.platform;
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      try {
+        expect(verifyPidFileOwnership({
+          pid: process.pid,
+          port: 37777,
+          startedAt: new Date().toISOString(),
+          startToken: 'Tue Aug 11 17:01:30 2026'
+        })).toBe(true);
+      } finally {
+        Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+      }
     });
   });
 
@@ -627,6 +689,60 @@ describe('ProcessManager', () => {
       removePidFile();
 
       expect(() => touchPidFile()).not.toThrow();
+    });
+  });
+
+  describe('maintainPidFile', () => {
+    const workerInfo: PidInfo = {
+      pid: process.pid,
+      port: 37777,
+      startedAt: new Date().toISOString()
+    };
+
+    it('recreates a missing PID file with the current token schema', () => {
+      removePidFile();
+
+      expect(maintainPidFile(workerInfo)).toBe('repaired');
+      expect(readPidFile()).toMatchObject({
+        pid: process.pid,
+        port: 37777,
+        startTokenV2: captureProcessStartToken(process.pid)
+      });
+    });
+
+    it('upgrades an owned legacy PID file', () => {
+      writeFileSync(PID_FILE, JSON.stringify({
+        ...workerInfo,
+        startToken: 'legacy-local-time-token'
+      }));
+
+      expect(maintainPidFile(workerInfo)).toBe('repaired');
+      const maintained = readPidFile();
+      expect(maintained?.startTokenV2).toBe(captureProcessStartToken(process.pid));
+      if (process.platform !== 'linux' && process.platform !== 'win32') {
+        expect(maintained?.startToken).toBeUndefined();
+      }
+    });
+
+    it('touches an already-current PID file', () => {
+      writePidFile(workerInfo);
+      const before = readFileSync(PID_FILE, 'utf-8');
+
+      expect(maintainPidFile(workerInfo)).toBe('current');
+      expect(readFileSync(PID_FILE, 'utf-8')).toBe(before);
+    });
+
+    it('leaves a different live owner untouched', () => {
+      const foreignInfo: PidInfo = {
+        pid: process.ppid,
+        port: 37777,
+        startedAt: new Date().toISOString()
+      };
+      writePidFile(foreignInfo);
+      const before = readFileSync(PID_FILE, 'utf-8');
+
+      expect(maintainPidFile(workerInfo)).toBe('foreign-owner');
+      expect(readFileSync(PID_FILE, 'utf-8')).toBe(before);
     });
   });
 
