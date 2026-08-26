@@ -82,4 +82,14 @@ if (!pluginEntry) {
 
 replaceVersionAfter(marketplacePath, '"name": "claude-mem"', expectedVersion);
 
+const installMarkerPath = 'plugin/.install-version';
+if (verifyOnly) {
+  const markerVersion = fs.readFileSync(installMarkerPath, 'utf8').trim();
+  if (markerVersion !== expectedVersion) {
+    throw new Error(`${installMarkerPath} has version ${markerVersion}, expected ${expectedVersion}`);
+  }
+} else {
+  fs.writeFileSync(installMarkerPath, `${expectedVersion}\n`);
+}
+
 process.stdout.write(`${expectedVersion}\n`);
