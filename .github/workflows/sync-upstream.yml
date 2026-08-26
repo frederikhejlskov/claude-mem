@@ -1,0 +1,329 @@
+name: Sync controlled fork with upstream
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Run even when upstream has no new commits
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: Build and test without updating fork main
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-mem-controlled-fork-sync
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect upstream updates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      base_sha: ${{ steps.detect.outputs.base_sha }}
+      changed: ${{ steps.detect.outputs.changed }}
+      upstream_sha: ${{ steps.detect.outputs.upstream_sha }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare fork with upstream
+        id: detect
+        env:
+          FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          set -euo pipefail
+          git remote add upstream-sync https://github.com/thedotmack/claude-mem.git
+          git fetch --no-tags upstream-sync main
+
+          base_sha=$(git rev-parse HEAD)
+          upstream_sha=$(git rev-parse upstream-sync/main)
+          changed=false
+          if ! git merge-base --is-ancestor "$upstream_sha" "$base_sha"; then
+            changed=true
+          fi
+          if [ "$FORCE_SYNC" = "true" ]; then
+            changed=true
+          fi
+
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: Merge, build, and test without write permission
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      candidate_sha: ${{ steps.finalize.outputs.candidate_sha }}
+      fork_version: ${{ steps.version.outputs.fork_version }}
+    steps:
+      - name: Checkout fork without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.3.14'
+
+      - name: Merge upstream with generated-file conflict policy
+        env:
+          BASE_SHA: ${{ needs.detect.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream-sync https://github.com/thedotmack/claude-mem.git
+          git fetch --no-tags upstream-sync main
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git rev-parse upstream-sync/main)" = "$UPSTREAM_SHA"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c sync-candidate
+
+          set +e
+          git merge --no-commit --no-ff "$UPSTREAM_SHA"
+          merge_status=$?
+          set -e
+
+          if [ "$merge_status" -ne 0 ]; then
+            disallowed_conflict=false
+            while IFS= read -r conflict_file; do
+              [ -n "$conflict_file" ] || continue
+              case "$conflict_file" in
+                package.json|.claude-plugin/marketplace.json|.claude-plugin/plugin.json|.codex-plugin/plugin.json|openclaw/openclaw.plugin.json|plugin/.claude-plugin/plugin.json|plugin/.codex-plugin/plugin.json|plugin/package.json|plugin/scripts/mcp-server.cjs|plugin/scripts/server-service.cjs|plugin/scripts/transcript-watcher.cjs|plugin/scripts/worker-service.cjs)
+                  git restore --source="$UPSTREAM_SHA" --staged --worktree -- "$conflict_file"
+                  ;;
+                *)
+                  echo "Unresolved source conflict: $conflict_file" >&2
+                  disallowed_conflict=true
+                  ;;
+              esac
+            done < <(git diff --name-only --diff-filter=U)
+
+            if [ "$disallowed_conflict" = "true" ] || git diff --name-only --diff-filter=U | grep -q .; then
+              echo 'Upstream overlaps the maintained PID fix. Manual review required.' >&2
+              exit 1
+            fi
+          fi
+
+          # Keep reviewed fork automation. Upstream workflow changes are not
+          # imported into a repository whose bot can later receive write access.
+          git restore --source="$BASE_SHA" --staged --worktree -- \
+            .github/workflows .github/fork-maintenance
+
+      - name: Derive a fork version newer than upstream
+        id: version
+        env:
+          UPSTREAM_SHA: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          upstream_version=$(git show "$UPSTREAM_SHA:package.json" | node -e \
+            "let s=''; process.stdin.on('data', d => s += d); process.stdin.on('end', () => process.stdout.write(JSON.parse(s).version));")
+          fork_version=$(node .github/fork-maintenance/set-fork-version.mjs "$upstream_version")
+          echo "fork_version=$fork_version" >> "$GITHUB_OUTPUT"
+          echo "FORK_VERSION=$fork_version" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Verify committed plugin lockfile
+        working-directory: plugin
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build distributable plugin
+        run: npm run build
+
+      - name: Verify hook and spawn disciplines
+        run: |
+          npm run lint:spawn-env
+          npm run lint:hook-io
+
+      - name: Freeze trusted automation and commit candidate
+        id: finalize
+        env:
+          BASE_SHA: ${{ needs.detect.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          git restore --source="$BASE_SHA" --staged --worktree -- \
+            .github/workflows .github/fork-maintenance
+          node .github/fork-maintenance/set-fork-version.mjs --verify "$FORK_VERSION"
+
+          grep -Fq "TZ: 'UTC'" src/supervisor/process-registry.ts
+          grep -Fq 'startTokenV2?: string' src/supervisor/process-registry.ts
+          grep -Fq 'maintainPidFile(pidInfo)' src/services/worker-service.ts
+          grep -Fq 'using /api/health pid for version recycle' src/shared/worker-utils.ts
+          git diff --check
+
+          mkdir -p "$RUNNER_TEMP/disabled-git-hooks"
+          git config core.hooksPath "$RUNNER_TEMP/disabled-git-hooks"
+          git add -A
+          git commit --allow-empty --no-verify -m \
+            "chore(fork): sync upstream ${UPSTREAM_SHA:0:12} as $FORK_VERSION"
+
+          candidate_sha=$(git rev-parse HEAD)
+          test -z "$(git status --short)"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "CANDIDATE_SHA=$candidate_sha" >> "$GITHUB_ENV"
+
+      - name: Test core suite
+        run: bun test tests
+
+      - name: Test OpenClaw suite
+        run: bun test openclaw
+
+      - name: Package tested candidate
+        env:
+          BASE_SHA: ${{ needs.detect.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse sync-candidate)" = "$CANDIDATE_SHA"
+          git bundle create candidate.bundle sync-candidate ^"$BASE_SHA" ^"$UPSTREAM_SHA"
+          git bundle verify candidate.bundle
+
+      - name: Upload tested Git bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: claude-mem-sync-${{ github.run_id }}
+          path: candidate.bundle
+          if-no-files-found: error
+          retention-days: 3
+
+  promote:
+    name: Fast-forward tested candidate without executing it
+    needs: [detect, prepare]
+    if: >-
+      needs.prepare.result == 'success' &&
+      !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout current fork main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Download tested Git bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: claude-mem-sync-${{ github.run_id }}
+
+      - name: Verify ancestry, fix invariants, and fast-forward main
+        env:
+          BASE_SHA: ${{ needs.detect.outputs.base_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+          FORK_VERSION: ${{ needs.prepare.outputs.fork_version }}
+          UPSTREAM_SHA: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          git remote add upstream-sync https://github.com/thedotmack/claude-mem.git
+          git fetch --no-tags upstream-sync main
+          test "$(git rev-parse upstream-sync/main)" = "$UPSTREAM_SHA"
+
+          git bundle verify candidate.bundle
+          git fetch candidate.bundle \
+            refs/heads/sync-candidate:refs/remotes/sync/candidate
+          candidate_sha=$(git rev-parse refs/remotes/sync/candidate)
+          test "$candidate_sha" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" "$candidate_sha"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" "$candidate_sha"
+          git diff --quiet "$BASE_SHA" "$candidate_sha" -- \
+            .github/workflows .github/fork-maintenance
+
+          git show "$candidate_sha:src/supervisor/process-registry.ts" | grep -Fq "TZ: 'UTC'"
+          git show "$candidate_sha:src/supervisor/process-registry.ts" | grep -Fq 'startTokenV2?: string'
+          git show "$candidate_sha:src/services/worker-service.ts" | grep -Fq 'maintainPidFile(pidInfo)'
+          git show "$candidate_sha:src/shared/worker-utils.ts" | grep -Fq 'using /api/health pid for version recycle'
+          actual_version=$(git show "$candidate_sha:package.json" | node -e \
+            "let s=''; process.stdin.on('data', d => s += d); process.stdin.on('end', () => process.stdout.write(JSON.parse(s).version));")
+          test "$actual_version" = "$FORK_VERSION"
+          case "$actual_version" in
+            *-fred.1) ;;
+            *) echo "Candidate is not a controlled fork version: $actual_version" >&2; exit 1 ;;
+          esac
+
+          git push origin "$candidate_sha:refs/heads/main"
+
+  report-failure:
+    name: Open or update sync alert
+    needs: [detect, prepare, promote]
+    if: >-
+      always() &&
+      (needs.detect.result == 'failure' ||
+       needs.prepare.result == 'failure' ||
+       needs.promote.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Report failed maintenance run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          UPSTREAM_SHA: ${{ needs.detect.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          title='Controlled fork sync needs attention'
+          issue_number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+          body=$(printf 'The weekly claude-mem upstream sync did not promote.\n\nRun: %s\nUpstream commit: `%s`\n\nThe installed fork remains unchanged.' "$RUN_URL" "${UPSTREAM_SHA:-unknown}")
+          if [ -n "$issue_number" ]; then
+            gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+
+  close-alert:
+    name: Close resolved sync alert
+    needs: [detect, prepare, promote]
+    if: needs.promote.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Close an existing maintenance alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title='Controlled fork sync needs attention'
+          issue_number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+          if [ -n "$issue_number" ]; then
+            gh issue close "$issue_number" --repo "$GITHUB_REPOSITORY" \
+              --comment 'A later weekly sync passed and promoted successfully.'
+          fi
